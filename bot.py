@@ -53,6 +53,20 @@ bot = telebot.TeleBot(TOKEN)
 
 # Словарь для хранения временных данных при редактировании контакта
 pending_contacts = {}
+pending_edits = {}
+
+def check_menu_escape(message):
+    if message.text in ["🏠 Главное меню", "/start", "/cancel"]:
+        chat_id = str(message.chat.id)
+        bot.clear_step_handler_by_chat_id(chat_id)
+        user_threads = load_json(DATA_FILE, {})
+        if chat_id in user_threads:
+            user_threads[chat_id].update({"state": None, "type": "chat", "tariff": None, "notified": False})
+            save_json(DATA_FILE, user_threads)
+        bot.send_message(chat_id, "🔄 Возвращаемся в главное меню.", reply_markup=get_reply_main_menu())
+        bot.send_message(chat_id, current_settings.get("txt_start", "🏠 Меню:"), reply_markup=get_main_menu(), parse_mode='HTML')
+        return True
+    return False
 
 # --- ФУНКЦИЯ ОЧИСТКИ ТЕКСТА ВАКАНСИИ ---
 def clean_vacancy_text(text):
@@ -91,7 +105,7 @@ def add_filter(pattern, is_regex=0):
         conn.close()
         return True
     except Exception as e:
-        print(f"❌ Ошибка добавления фильтра: {e}")
+        print(f"❌ Ошибка добавления фильма: {e}")
         return False
 
 def delete_filter(filter_id):
@@ -850,6 +864,7 @@ def get_special_moderation_markup(message_id, message_link=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
         types.InlineKeyboardButton("✏️ Ввести контакт", callback_data=f"edit_contact_{message_id}"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}"),
         types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub_approve_special_{message_id}"),
         types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pub_decline_special_{message_id}")
     ]
@@ -861,9 +876,10 @@ def get_special_moderation_markup(message_id, message_link=None):
 def get_special_moderation_after_edit_markup(message_id, message_link=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
+        types.InlineKeyboardButton("🔄 Изменить контакт", callback_data=f"edit_contact_{message_id}"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}"),
         types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub_approve_special_{message_id}"),
-        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pub_decline_special_{message_id}"),
-        types.InlineKeyboardButton("🔄 Изменить контакт", callback_data=f"edit_contact_{message_id}")
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pub_decline_special_{message_id}")
     ]
     if message_link:
         buttons.insert(0, types.InlineKeyboardButton("🔗 Источник", url=message_link))
@@ -873,6 +889,7 @@ def get_special_moderation_after_edit_markup(message_id, message_link=None):
 # ==================== ЛОГИКА ШАГОВ ====================
 
 def process_db_add(message, table):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and message.text.startswith('/'): return
     if add_db_item(table, message.text):
@@ -886,6 +903,7 @@ def process_db_add(message, table):
     bot.send_message(chat_id, f"📡 Меню управления: {table}", reply_markup=get_db_manage_markup(table))
 
 def save_new_setting(message, key):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text == '/start' or message.text == '/admin_panel': return
     current_settings[key] = message.text
@@ -900,6 +918,7 @@ def save_new_setting(message, key):
         safe_send_message(chat_id, f"✅ Обновлено!", reply_markup=get_admin_panel_markup())
 
 def process_submission_time(message, user_data):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and message.text.startswith('/'): return
     user_threads = load_json(DATA_FILE, {})
@@ -910,6 +929,7 @@ def process_submission_time(message, user_data):
     bot.send_message(chat_id, "💎 Выберите тип размещения:", reply_markup=get_tariff_menu())
 
 def wait_for_screenshot(message, user_data):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and message.text.startswith('/'): return
     user_threads = load_json(DATA_FILE, {})
@@ -1506,6 +1526,33 @@ def callback_handler(call):
         bot.answer_callback_query(call.id, "Введите username автора")
         return
 
+    if data.startswith("edit_text_"):
+        original_message_id = int(data.replace("edit_text_", ""))
+        message_link = None
+        if call.message.reply_markup:
+            try:
+                for row in call.message.reply_markup.keyboard:
+                    for btn in row:
+                        if hasattr(btn, 'url') and btn.url and "t.me" in btn.url:
+                            message_link = btn.url
+                            break
+            except Exception as e:
+                print(f"Ошибка при поиске ссылки: {e}")
+        pending_edits[original_message_id] = {
+            "original_text": call.message.text,
+            "message_link": message_link,
+            "user_id": chat_id
+        }
+        msg = bot.send_message(
+            chat_id,
+            "✏️ <b>Отправьте измененный текст вакансии/резюме целиком.</b>\n\n"
+            "Вы можете скопировать текущий текст, отредактировать его и отправить сюда.",
+            parse_mode='HTML'
+        )
+        pending_edits[original_message_id]["request_msg_id"] = msg.message_id
+        bot.answer_callback_query(call.id, "Отправьте измененный текст")
+        return
+
     if data.startswith("pub_approve_special_"):
         original_message_id = int(data.replace("pub_approve_special_", ""))
         markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1767,6 +1814,7 @@ def callback_handler(call):
 # ==================== ДОБАВЛЕНИЕ В ЧС (ШАГ) ====================
 
 def add_blocked_user_step(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     
@@ -1808,6 +1856,7 @@ def add_blocked_user_step(message):
     bot.register_next_step_handler(msg, save_blocked_user_reason)
 
 def save_blocked_user_reason(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     
@@ -1842,9 +1891,34 @@ def save_blocked_user_reason(message):
 # ==================== КОНЕЦ ДОБАВЛЕНИЯ В ЧС ====================
 
 # Обработка текстовых сообщений от админа
-@bot.message_handler(func=lambda m: (m.from_user.id in ADMIN_IDS) and pending_contacts)
+@bot.message_handler(func=lambda m: (m.from_user.id in ADMIN_IDS) and (pending_contacts or pending_edits))
 def handle_admin_text(message):
     chat_id = str(message.chat.id)
+    
+    # Сначала проверяем pending_edits
+    for original_msg_id, data in list(pending_edits.items()):
+        if data.get("user_id") == chat_id:
+            new_text = message.text
+            try:
+                bot.edit_message_text(
+                    new_text,
+                    SUPER_GROUP_ID,
+                    original_msg_id,
+                    parse_mode='HTML',
+                    reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"))
+                )
+                bot.send_message(chat_id, "✅ Текст сообщения изменен!")
+                try:
+                    bot.delete_message(chat_id, data.get("request_msg_id"))
+                except Exception as e:
+                    print(f"⚠️ Не удалось удалить сообщение запроса: {e}")
+                del pending_edits[original_msg_id]
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ Ошибка при изменении текста: {error_msg}")
+                bot.send_message(chat_id, f"❌ Ошибка: {error_msg}")
+            return
+
     for original_msg_id, data in list(pending_contacts.items()):
         if data.get("user_id") == chat_id:
             contact_input = message.text.strip()
@@ -1892,6 +1966,7 @@ def handle_admin_text(message):
 
 # Обработчики для шагов добавления
 def save_recommend_button_text(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and not message.text.startswith('/'):
         update_recommend_settings(button_text=message.text)
@@ -1902,6 +1977,7 @@ def save_recommend_button_text(message):
         save_json(DATA_FILE, user_threads)
 
 def save_select_category_text(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and not message.text.startswith('/'):
         update_recommend_settings(select_category_text=message.text)
@@ -1912,6 +1988,7 @@ def save_select_category_text(message):
         save_json(DATA_FILE, user_threads)
 
 def save_select_specialist_text(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and not message.text.startswith('/'):
         update_recommend_settings(select_specialist_text=message.text)
@@ -1922,6 +1999,7 @@ def save_select_specialist_text(message):
         save_json(DATA_FILE, user_threads)
 
 def add_category_step(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     if message.text and not message.text.startswith('/'):
         text = message.text.strip()
@@ -1935,6 +2013,7 @@ def add_category_step(message):
         save_json(DATA_FILE, user_threads)
 
 def add_filter_step(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     if user_threads.get(chat_id, {}).get("state") != "adding_filter":
@@ -1962,6 +2041,7 @@ def add_filter_step(message):
         save_json(DATA_FILE, user_threads)
 
 def add_card_text_step(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     if message.text and not message.text.startswith('/'):
@@ -1981,6 +2061,7 @@ def add_card_text_step(message):
             save_json(DATA_FILE, user_threads)
 
 def add_card_photo_step(message):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     photo_file_id = None
@@ -2001,6 +2082,7 @@ def add_card_photo_step(message):
         bot.send_message(chat_id, "❌ Ошибка: не хватает данных")
 
 def add_card_contact_step(message, photo_file_id):
+    if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
     if message.text and not message.text.startswith('/'):
@@ -2083,8 +2165,8 @@ def handle_admin_reply(message):
 @bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text', 'photo', 'video', 'document', 'animation'])
 def handle_user_messages(message):
     chat_id = str(message.chat.id)
-    if (message.from_user.id in ADMIN_IDS) and pending_contacts:
-        for original_msg_id, data in pending_contacts.items():
+    if (message.from_user.id in ADMIN_IDS) and (pending_contacts or pending_edits):
+        for original_msg_id, data in {**pending_contacts, **pending_edits}.items():
             if data.get("user_id") == chat_id:
                 handle_admin_text(message)
                 return

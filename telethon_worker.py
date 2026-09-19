@@ -15,7 +15,7 @@ API_ID = int(os.getenv('API_ID', 33481567))
 API_HASH = os.getenv('API_HASH', "93d073404049ef77e94be613d29fb57d")
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в переменных окружения!")
+    raise ValueError("❌ BOT_TOKEN не найден в переменных очередей!")
 
 TARGET_GROUP_ID = -1003455134116
 PROBLEM_CHAT_ID = -1001156193082
