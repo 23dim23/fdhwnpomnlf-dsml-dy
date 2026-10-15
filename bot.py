@@ -7,6 +7,8 @@ import re
 from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
+import threading
+import time
 
 load_dotenv()
 
@@ -68,16 +70,101 @@ def check_menu_escape(message):
         return True
     return False
 
+def balance_html_tags(html):
+    """Добавляет недостающие закрывающие теги в HTML-строку"""
+    if not html:
+        return ""
+    
+    tag_pattern = re.compile(r'<(/?)([a-zA-Z1-6]+)(?:\s+[^>]*?)?>')
+    open_tags = []
+    void_tags = {'img', 'br', 'hr', 'input', 'meta', 'link'}
+    
+    for match in tag_pattern.finditer(html):
+        is_closing = bool(match.group(1))
+        tag_name = match.group(2).lower()
+        if tag_name in void_tags:
+            continue
+        if not is_closing:
+            open_tags.append(tag_name)
+        else:
+            if open_tags and open_tags[-1] == tag_name:
+                open_tags.pop()
+            elif tag_name in open_tags:
+                while open_tags:
+                    popped = open_tags.pop()
+                    if popped == tag_name:
+                        break
+                        
+    for tag in reversed(open_tags):
+        html += f"</{tag}>"
+    return html
+
 # --- ФУНКЦИЯ ОЧИСТКИ ТЕКСТА ВАКАНСИИ ---
 def clean_vacancy_text(text):
     """Удаляет шапку, контакт, инструкцию и хэштеги, оставляя чистый текст вакансии"""
     text = re.sub(r'^\| 🇻 🇦 🇨 🇦 🇳 🇨 🇾 \|\n*\n*', '', text)
     text = re.sub(r'\n*Контакт для связи:.*?\n*\n*', '\n', text, flags=re.DOTALL)
-    text = re.sub(r'\n*<b><code>Для публикации вакансии\\резюме.*?</a></b>\n*', '', text, flags=re.DOTALL)
+    text = re.sub(r'\n*(<b><code>Для публикации|<b>Для публикации|Для публикации).*?</a></b>\n*', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'\n*#вакансия\s*#парсер\s*$', '', text)
     text = re.sub(r'\n*#вакансия\s*#\w+\s*$', '', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+def extract_body_and_contact(orig_text):
+    if not orig_text:
+        return "", "Не указан"
+    body = orig_text.strip()
+    # Удаляем шапку вакансии (с тегами <b> или без них)
+    body = re.sub(r'^\s*<b>\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\s*</b>', '', body, flags=re.IGNORECASE)
+    body = re.sub(r'^\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|', '', body, flags=re.IGNORECASE)
+    body = re.sub(r'^\s*<b>\s*\|\s*🇷\s*🇪\s*🇸\s*🇺\s*🇲\s*🇪\s*\|\s*</b>', '', body, flags=re.IGNORECASE)
+    body = re.sub(r'^\s*\|\s*🇷\s*🇪\s*🇸\s*🇺\s*🇲\s*🇪\s*\|', '', body, flags=re.IGNORECASE)
+    
+    contact = "Не указан"
+    # Ищем блок Контакт для связи
+    contact_match = re.search(r'<b>\s*Контакт для связи:\s*</b>\s*(.*?)(?=\n*<b><code>Для публикации|\n*<b>Для публикации|\n*Для публикации|$)', body, flags=re.DOTALL | re.IGNORECASE)
+    if not contact_match:
+        contact_match = re.search(r'Контакт для связи:\s*(.*?)(?=\n*<b><code>Для публикации|\n*<b>Для публикации|\n*Для публикации|$)', body, flags=re.DOTALL | re.IGNORECASE)
+    
+    if contact_match:
+        contact = contact_match.group(1).strip()
+        body = body[:contact_match.start()].strip()
+        # Чистим незакрытые теги на конце body
+        body = re.sub(r'<(b|strong|i|em|code|span|a|pre)>\s*$', '', body, flags=re.IGNORECASE)
+        if body.endswith('<'):
+            body = body[:-1].strip()
+    else:
+        body = re.sub(r'\n*<b><code>Для публикации.*$', '', body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r'\n*<b>Для публикации.*$', '', body, flags=re.DOTALL | re.IGNORECASE)
+        body = re.sub(r'\n*Для публикации.*$', '', body, flags=re.DOTALL | re.IGNORECASE)
+
+    # Очищаем теги в конце
+    body = re.sub(r'\n*#вакансия\s*#парсер\s*$', '', body, flags=re.IGNORECASE)
+    body = re.sub(r'\n*#[a-zA-Zа-яА-ЯёЁ0-9_]+\s*$', '', body)
+    
+    return body.strip(), contact.strip()
+
+def build_updated_vacancy_text(body, contact):
+    header = "<b>| 🇻 🇦 🇨 🇦 🇳 🇨 🇾 |</b>\n\n"
+    if not contact or "Контакт не найден" in contact or "⚠️" in contact:
+        contact_block = "<b>Контакт для связи:</b>\n<i>⚠️ Контакт не найден (укажите @username или добавьте контакт в текст)</i>\n\n"
+    else:
+        clean_c = contact.strip()
+        if clean_c.startswith('@') or clean_c.startswith('http'):
+            formatted = clean_c
+        elif 't.me/' in clean_c:
+            formatted = f"@{clean_c.split('t.me/')[-1]}"
+        else:
+            formatted = f"@{clean_c}"
+        contact_block = f"<b>Контакт для связи:</b>\n{formatted}\n\n"
+        
+    instruction = (
+        "<b>Для публикации вакансии\\резюме, напишите заявку в "
+        "<a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
+    )
+    tags = "\n\n#вакансия #парсер"
+    balanced_body = balance_html_tags(body)
+    return f"{header}{balanced_body}\n\n{contact_block}{instruction}{tags}"
 
 # ==================== ФИЛЬТРЫ ТЕКСТА ====================
 
@@ -156,7 +243,7 @@ def apply_filters(text):
 def get_blocked_users():
     """Получить список всех заблокированных пользователей"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
         cursor = conn.cursor()
         cursor.execute("SELECT id, user_id, username, reason, created_at FROM blocked_users ORDER BY created_at DESC")
         users = cursor.fetchall()
@@ -169,11 +256,28 @@ def get_blocked_users():
 def add_blocked_user(user_id, username=None, reason=None):
     """Добавить пользователя в чёрный список"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
         cursor = conn.cursor()
+        
+        # Нормализуем username
+        clean_username = None
+        if username:
+            clean_username = str(username).strip().replace('@', '').lower()
+            
+        # Нормализуем user_id
+        clean_user_id = str(user_id).strip()
+        if not clean_user_id.lstrip('-').isdigit():
+            clean_user_id = clean_user_id.replace('@', '').lower()
+            
+        # Проверяем, существует ли уже такая запись
+        cursor.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (clean_user_id,))
+        if cursor.fetchone():
+            conn.close()
+            return False # Уже существует
+            
         cursor.execute(
             "INSERT INTO blocked_users (user_id, username, reason) VALUES (?, ?, ?)",
-            (str(user_id), username, reason)
+            (clean_user_id, clean_username, reason)
         )
         conn.commit()
         conn.close()
@@ -185,9 +289,13 @@ def add_blocked_user(user_id, username=None, reason=None):
 def remove_blocked_user(user_id):
     """Удалить пользователя из чёрного списка"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM blocked_users WHERE user_id = ?", (str(user_id),))
+        clean_user_id = str(user_id).strip()
+        if not clean_user_id.lstrip('-').isdigit():
+            clean_user_id = clean_user_id.replace('@', '').lower()
+            
+        cursor.execute("DELETE FROM blocked_users WHERE user_id = ? OR LOWER(username) = ?", (clean_user_id, clean_user_id))
         conn.commit()
         conn.close()
         return True
@@ -195,15 +303,89 @@ def remove_blocked_user(user_id):
         print(f"❌ Ошибка удаления из ЧС: {e}")
         return False
 
-def is_user_blocked(user_id):
-    """Проверить, заблокирован ли пользователь"""
+def is_user_blocked(user_id=None, username=None):
+    """Проверить, заблокирован ли пользователь или канал по ID или по @username"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (str(user_id),))
-        result = cursor.fetchone()
+        
+        ids = []
+        usernames = []
+        
+        def process_input(val):
+            if not val:
+                return
+            s = str(val).strip()
+            if not s:
+                return
+                
+            if 'tg://user?id=' in s:
+                pid = s.split('tg://user?id=')[-1].split('&')[0]
+                if pid.isdigit():
+                    ids.append(int(pid))
+                    return
+            
+            if 't.me/' in s:
+                part = s.split('t.me/')[-1].split('?')[0]
+                parts = [p for p in part.split('/') if p]
+                if parts:
+                    u = parts[0]
+                    if u == 'c' and len(parts) > 1:
+                        pid = parts[1]
+                        if pid.isdigit():
+                            ids.append(int(pid))
+                    elif u != 'c' and u != '+' and not u.startswith('joinchat'):
+                        usernames.append(u.replace('@', '').lower())
+                return
+                
+            if s.startswith('@'):
+                usernames.append(s[1:].lower())
+                return
+                
+            if s.lstrip('-').isdigit():
+                ids.append(int(s))
+                return
+                
+            usernames.append(s.replace('@', '').lower())
+            
+        process_input(user_id)
+        process_input(username)
+        
+        if ids:
+            candidates = []
+            for item in ids:
+                s_id = str(item)
+                candidates.append(s_id)
+                abs_val = abs(item)
+                if str(abs_val).startswith('100'):
+                    raw_id = str(abs_val)[3:]
+                    candidates.extend([raw_id, f"-{raw_id}", f"-100{raw_id}", str(abs_val), f"-{abs_val}"])
+                else:
+                    candidates.extend([str(abs_val), f"-{abs_val}", f"-100{abs_val}"])
+            
+            candidates = list(set(candidates))
+            placeholders = ','.join('?' for _ in candidates)
+            cursor.execute(f"SELECT 1 FROM blocked_users WHERE user_id IN ({placeholders})", candidates)
+            if cursor.fetchone():
+                conn.close()
+                return True
+                
+        if usernames:
+            for u in list(usernames):
+                usernames.append(f"@{u}")
+            usernames = list(set(usernames))
+            
+            for u in usernames:
+                cursor.execute(
+                    "SELECT 1 FROM blocked_users WHERE LOWER(username) = ? OR LOWER(user_id) = ?",
+                    (u.lower(), u.lower())
+                )
+                if cursor.fetchone():
+                    conn.close()
+                    return True
+                    
         conn.close()
-        return result is not None
+        return False
     except Exception as e:
         print(f"❌ Ошибка проверки ЧС: {e}")
         return False
@@ -211,22 +393,38 @@ def is_user_blocked(user_id):
 def parse_user_input(text):
     """Парсит ввод пользователя: ID, @username, ссылка"""
     text = text.strip()
-    
-    # Если это ссылка на профиль
+    if not text:
+        return None, None
+        
+    # Если это ссылка на профиль или сообщение
     if 't.me/' in text:
-        username = text.split('t.me/')[-1]
-        return None, username
-    
+        part = text.split('t.me/')[-1]
+        part = part.split('?')[0] # Убираем параметры
+        parts = [p for p in part.split('/') if p]
+        if parts:
+            username = parts[0]
+            # Если это приватный канал/чат в формате t.me/c/12345/678
+            if username == 'c' and len(parts) > 1:
+                possible_id = parts[1]
+                if possible_id.isdigit():
+                    val = int(possible_id)
+                    if str(val).startswith('100'):
+                        return -val, None
+                    else:
+                        return int(f"-100{val}"), None
+            # Для публичных ссылок
+            return None, username.strip().replace('@', '')
+            
     # Если это @username
     if text.startswith('@'):
-        return None, text[1:]
-    
+        return None, text[1:].strip()
+        
     # Если это число (ID)
     if text.lstrip('-').isdigit():
         return int(text), None
-    
+        
     # Если это просто username без @
-    return None, text
+    return None, text.strip()
 
 # ==================== КОНЕЦ ЧЁРНОГО СПИСКА ====================
 
@@ -573,6 +771,42 @@ def save_json(filename, data):
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def update_topic_marker(user_id, marker):
+    """
+    Обновляет визуальный маркер темы (первый символ) в супергруппе.
+    Цвета маркеров:
+    🔵 Синий - новый пользователь зашел в бота.
+    🟡 Желтый - оформление публикации.
+    🟢 Зеленый - отправлен чек об оплате.
+    ⚫ Черный - оплата подтверждена админом.
+    🔴 Красный - новое сообщение от пользователя.
+    🟣 Фиолетовый - новое сообщение от админа.
+    """
+    try:
+        user_threads = load_json(DATA_FILE, {})
+        chat_id_str = str(user_id)
+        if chat_id_str not in user_threads:
+            return
+        
+        thread_id = user_threads[chat_id_str].get("thread_id")
+        if not thread_id:
+            return
+            
+        user_name = user_threads[chat_id_str].get("user_name")
+        if not user_name:
+            try:
+                chat_info = bot.get_chat(user_id)
+                user_name = chat_info.first_name or "User"
+            except:
+                user_name = "User"
+            user_threads[chat_id_str]["user_name"] = user_name
+            save_json(DATA_FILE, user_threads)
+            
+        new_name = f"{marker} {user_name} ({chat_id_str})"
+        bot.edit_forum_topic(SUPER_GROUP_ID, thread_id, name=new_name)
+    except Exception as e:
+        print(f"⚠️ Ошибка обновления маркера темы для {user_id}: {e}")
+
 DEFAULT_SETTINGS = {
     "pay_rf": "💳 <b>Карта РФ (СБП):</b>\n<code>0000 0000 0000 0000</code>\nПолучатель: Иван И.",
     "pay_rb": "🇧🇾 <b>Карта РБ:</b>\n<code>0000 0000 0000 0000</code>\nПолучатель: Иван И.",
@@ -886,6 +1120,76 @@ def get_special_moderation_after_edit_markup(message_id, message_link=None):
     markup.add(*buttons)
     return markup
 
+# ==================== ФОРМАТИРОВАНИЕ ПОСТОВ ====================
+def get_user_type_by_thread(thread_id):
+    if not thread_id:
+        return "vacancy"
+    try:
+        u_threads = load_json(DATA_FILE, {})
+        for uid, udata in u_threads.items():
+            if udata.get("thread_id") is not None and str(udata.get("thread_id")) == str(thread_id):
+                return udata.get("type", "vacancy")
+    except Exception as e:
+        print(f"Ошибка получения типа по потоку: {e}")
+    return "vacancy"
+
+def is_post_resume_by_context(post_text, thread_id=None):
+    if thread_id:
+        u_type = get_user_type_by_thread(thread_id)
+        if u_type == "resume":
+            return True
+        if u_type == "vacancy":
+            return False
+            
+    # Если поток не найден или это парсер, ищем ТОЛЬКО явный хэштег #резюме или заголовок резюме
+    # (обычное слово "резюме" в тексте не должно приводить к ложной классификации!)
+    if "#резюме" in post_text.lower() or "| 🇷 🇪 🇸 🇺 🇲 🇪 |" in post_text:
+        return True
+    return False
+
+def format_post(post_text, category, is_resume=False):
+    # 1. Очищаем текст от старых хэштегов в конце (рекурсивно снимаем все хэштеги с конца)
+    clean = post_text.strip()
+    while True:
+        prev_len = len(clean)
+        clean = re.sub(r'#[a-zA-Zа-яА-ЯёЁ0-9_]+\s*$', '', clean).strip()
+        if len(clean) == prev_len:
+            break
+    
+    # 2. Получаем базовые теги для выбранного канала
+    config = CHANNELS_CONFIG.get(category, {"tags": ""})
+    tags = config["tags"]
+    
+    # 3. Вырезаем старые баннеры/инструкции, если они были прилеплены
+    clean_base = re.sub(r'\n*<b><code>Для публикации.*$', '', clean, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean_base = re.sub(r'\n*<b>Для публикации.*$', '', clean_base, flags=re.DOTALL | re.IGNORECASE).strip()
+    clean_base = re.sub(r'\n*Для публикации.*$', '', clean_base, flags=re.DOTALL | re.IGNORECASE).strip()
+    
+    # 4. Убираем ВСЕ возможные старые заголовки из начала текста, чтобы они не двоились!
+    while True:
+        prev_len = len(clean_base)
+        clean_base = re.sub(r'^\s*\|\s*🇷\s*🇪\s*🇸\s*🇺\s*🇲\s*🇪\s*\|\s*', '', clean_base, flags=re.IGNORECASE).strip()
+        clean_base = re.sub(r'^\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\s*', '', clean_base, flags=re.IGNORECASE).strip()
+        # Также уберем в жирном начертании, если они были с тегами
+        clean_base = re.sub(r'^\s*<b>\s*\|\s*🇷\s*🇪\s*🇸\s*🇺\s*🇲\s*🇪\s*\|\s*</b>\s*', '', clean_base, flags=re.IGNORECASE).strip()
+        clean_base = re.sub(r'^\s*<b>\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\s*</b>\s*', '', clean_base, flags=re.IGNORECASE).strip()
+        if len(clean_base) == prev_len:
+            break
+
+    # 5. Применяем нужный заголовок и хэштеги в зависимости от типа поста
+    instr = "<b>Для публикации вакансии\\резюме, напишите заявку в <a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
+    
+    if is_resume:
+        header = "<b>| 🇷 🇪 🇸 🇺 🇲 🇪 |</b>\n\n"
+        tags = tags.replace("#вакансия", "#резюме")
+    else:
+        header = "<b>| 🇻 🇦 🇨 🇦 🇳 🇨 🇾 |</b>\n\n"
+        tags = tags.replace("#резюме", "#вакансия")
+        
+    balanced_clean_base = balance_html_tags(clean_base)
+    final = f"{header}{balanced_clean_base}\n\n{instr}{tags}"
+    return final
+
 # ==================== ЛОГИКА ШАГОВ ====================
 
 def process_db_add(message, table):
@@ -923,6 +1227,7 @@ def process_submission_time(message, user_data):
     if message.text and message.text.startswith('/'): return
     user_threads = load_json(DATA_FILE, {})
     user_threads[chat_id]["state"] = "waiting_tariff"
+    user_threads[chat_id]["desired_time"] = message.text
     save_json(DATA_FILE, user_threads)
     log_action(chat_id, f"Указал время: <code>{message.text}</code>")
     bot.send_message(SUPER_GROUP_ID, f"⏰ <b>Желаемое время:</b> {message.text}", message_thread_id=user_data["thread_id"], parse_mode='HTML')
@@ -948,6 +1253,7 @@ def wait_for_screenshot(message, user_data):
     bot.copy_message(SUPER_GROUP_ID, chat_id, message.message_id, message_thread_id=user_data["thread_id"])
     success_text = current_settings.get("txt_success_pay") or "⏳ Чек принят."
     safe_send_message(chat_id, success_text, reply_markup=get_main_menu())
+    update_topic_marker(chat_id, "🟢")
     user_threads = load_json(DATA_FILE, {})
     user_threads[chat_id].update({"state": None, "type": "chat", "tariff": None})
     save_json(DATA_FILE, user_threads)
@@ -985,6 +1291,9 @@ def callback_handler(call):
             )
         except:
             bot.send_message(chat_id, "🛡️ Управление чёрным списком", reply_markup=get_blocklist_markup())
+        try:
+            bot.answer_callback_query(call.id)
+        except: pass
         return
 
     if data == "blocklist_list":
@@ -999,6 +1308,9 @@ def callback_handler(call):
             )
         except:
             bot.send_message(chat_id, "📋 Чёрный список", reply_markup=get_blocklist_list_markup())
+        try:
+            bot.answer_callback_query(call.id)
+        except: pass
         return
 
     if data == "blocklist_add":
@@ -1016,6 +1328,9 @@ def callback_handler(call):
             reply_markup=get_cancel_menu()
         )
         bot.register_next_step_handler(msg, add_blocked_user_step)
+        try:
+            bot.answer_callback_query(call.id)
+        except: pass
         return
 
     if data == "blocklist_remove":
@@ -1029,6 +1344,9 @@ def callback_handler(call):
             markup.add(types.InlineKeyboardButton(f"❌ {display}", callback_data=f"blocklist_del_{u['user_id']}"))
         markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data="adm_blocklist"))
         bot.send_message(chat_id, "🗑️ Выберите пользователя для удаления из ЧС:", reply_markup=markup)
+        try:
+            bot.answer_callback_query(call.id)
+        except: pass
         return
 
     if data.startswith("blocklist_del_"):
@@ -1054,6 +1372,9 @@ def callback_handler(call):
             text += f"📝 Причина: {u[2] or '❌ Не указана'}\n"
             text += f"📅 Добавлен: {u[3]}"
             bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=get_nav_menu("blocklist_list"))
+        try:
+            bot.answer_callback_query(call.id)
+        except: pass
         return
 
     if data == "blocklist_empty":
@@ -1509,20 +1830,47 @@ def callback_handler(call):
                             break
             except Exception as e:
                 print(f"Ошибка при поиске ссылки: {e}")
+        
+        orig_text = getattr(call.message, 'html_text', None) or call.message.text or getattr(call.message, 'html_caption', None) or call.message.caption or ""
+        thread_id = getattr(call.message, 'message_thread_id', None)
+        target_chat_id = call.message.chat.id
+        
         pending_contacts[original_message_id] = {
-            "original_text": call.message.text,
+            "original_text": orig_text,
             "message_link": message_link,
-            "user_id": chat_id
+            "chat_id": str(target_chat_id),
+            "user_id": str(target_chat_id),
+            "admin_id": call.from_user.id,
+            "thread_id": thread_id,
+            "original_message_id": original_message_id
         }
-        msg = bot.send_message(
-            chat_id,
-            "✏️ Введите username автора в формате:\n"
-            "`@username`\n\n"
-            "Или отправьте ссылку на профиль:\n"
-            "`https://t.me/username`",
-            parse_mode='Markdown'
-        )
-        pending_contacts[original_message_id]["request_msg_id"] = msg.message_id
+        
+        try:
+            msg = bot.send_message(
+                target_chat_id,
+                "✏️ Введите username автора в формате:\n"
+                "`@username`\n\n"
+                "Или отправьте ссылку на профиль:\n"
+                "`https://t.me/username`\n\n"
+                "<i>Для отмены отправьте /cancel</i>",
+                parse_mode='HTML',
+                message_thread_id=thread_id,
+                reply_to_message_id=call.message.message_id
+            )
+            pending_contacts[original_message_id]["request_msg_id"] = msg.message_id
+        except Exception as e:
+            print(f"⚠️ Ошибка отправки запроса контакта с thread_id/reply: {e}")
+            msg = bot.send_message(
+                target_chat_id,
+                "✏️ Введите username автора в формате:\n"
+                "`@username`\n\n"
+                "Или отправьте ссылку на профиль:\n"
+                "`https://t.me/username`\n\n"
+                "<i>Для отмены отправьте /cancel</i>",
+                parse_mode='HTML'
+            )
+            pending_contacts[original_message_id]["request_msg_id"] = msg.message_id
+            
         bot.answer_callback_query(call.id, "Введите username автора")
         return
 
@@ -1538,18 +1886,46 @@ def callback_handler(call):
                             break
             except Exception as e:
                 print(f"Ошибка при поиске ссылки: {e}")
+                
+        orig_text = getattr(call.message, 'html_text', None) or call.message.text or getattr(call.message, 'html_caption', None) or call.message.caption or ""
+        body, contact = extract_body_and_contact(orig_text)
+        thread_id = getattr(call.message, 'message_thread_id', None)
+        target_chat_id = call.message.chat.id
+        
         pending_edits[original_message_id] = {
-            "original_text": call.message.text,
+            "original_text": orig_text,
+            "contact": contact,
             "message_link": message_link,
-            "user_id": chat_id
+            "chat_id": str(target_chat_id),
+            "user_id": str(target_chat_id),
+            "admin_id": call.from_user.id,
+            "thread_id": thread_id,
+            "original_message_id": original_message_id
         }
-        msg = bot.send_message(
-            chat_id,
-            "✏️ <b>Отправьте измененный текст вакансии/резюме целиком.</b>\n\n"
-            "Вы можете скопировать текущий текст, отредактировать его и отправить сюда.",
-            parse_mode='HTML'
-        )
-        pending_edits[original_message_id]["request_msg_id"] = msg.message_id
+        try:
+            msg = bot.send_message(
+                target_chat_id,
+                "✏️ <b>Отправьте измененный текст вакансии/резюме.</b>\n\n"
+                "Вы редактируете следующее описание:\n"
+                f"<pre>{body}</pre>\n\n"
+                "⚠️ <i>Отправьте новый текст описания вакансии/резюме. Шапку 'VACANCY', контакт для связи и теги бот сохранит и применит автоматически!\nДля отмены отправьте /cancel</i>",
+                parse_mode='HTML',
+                message_thread_id=thread_id,
+                reply_to_message_id=call.message.message_id
+            )
+            pending_edits[original_message_id]["request_msg_id"] = msg.message_id
+        except Exception as e:
+            print(f"⚠️ Ошибка отправки запроса редактирования с thread_id/reply: {e}")
+            msg = bot.send_message(
+                target_chat_id,
+                "✏️ <b>Отправьте измененный текст вакансии/резюме.</b>\n\n"
+                "Вы редактируете следующее описание:\n"
+                f"<pre>{body}</pre>\n\n"
+                "⚠️ <i>Отправьте новый текст описания вакансии/резюме. Шапку 'VACANCY', контакт для связи и теги бот сохранит и применит автоматически!\nДля отмены отправьте /cancel</i>",
+                parse_mode='HTML'
+            )
+            pending_edits[original_message_id]["request_msg_id"] = msg.message_id
+            
         bot.answer_callback_query(call.id, "Отправьте измененный текст")
         return
 
@@ -1580,11 +1956,10 @@ def callback_handler(call):
         config = CHANNELS_CONFIG.get(category)
         if config:
             target = config["channel"]
-            tags = config["tags"]
             orig = call.message.text or call.message.caption or ""
-            clean = re.sub(r'#\w+(\s+#\w+)*\s*$', '', orig).strip()
-            instr = "<b><code>Для публикации вакансии\\резюме, напишите заявку в </code><a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
-            final = f"{clean.split('Для публикации вакансии')[0].strip()}\n\n{instr}{tags}"
+            # Спаршенные посты всегда являются вакансиями
+            is_resume = False
+            final = format_post(orig, category, is_resume=is_resume)
             try:
                 if call.message.content_type in ['photo', 'video', 'animation']:
                     sent = bot.copy_message(target, chat_id, call.message.message_id, caption=final, parse_mode='HTML')
@@ -1622,11 +1997,9 @@ def callback_handler(call):
         config = CHANNELS_CONFIG.get(category)
         if config:
             target = config["channel"]
-            tags = config["tags"]
             orig = call.message.text or call.message.caption or ""
-            clean = re.sub(r'#\w+(\s+#\w+)*\s*$', '', orig).strip()
-            instr = "<b><code>Для публикации вакансии\\резюме, напишите заявку в </code><a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
-            final = f"{clean.split('Для публикации вакансии')[0].strip()}\n\n{instr}{tags}"
+            is_resume = is_post_resume_by_context(orig, call.message.message_thread_id)
+            final = format_post(orig, category, is_resume=is_resume)
             try:
                 if call.message.content_type in ['photo', 'video', 'animation']:
                     sent = bot.copy_message(target, chat_id, call.message.message_id, caption=final, parse_mode='HTML')
@@ -1652,12 +2025,71 @@ def callback_handler(call):
             except:
                 bot.send_message(chat_id, f"✅ <b>Оплата подтверждена.</b>", parse_mode='HTML')
             bot.send_message(target_id, "✅ <b>Ваша оплата подтверждена!</b>", parse_mode='HTML')
+            update_topic_marker(target_id, "⚫")
+            
+            # Сразу предлагаем выбрать канал для моментальной публикации
+            u_threads = load_json(DATA_FILE, {})
+            u_data = u_threads.get(target_id, {})
+            desired = u_data.get("desired_time", "Не указано")
+            
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            buttons = [types.InlineKeyboardButton(name, callback_data=f"publish_now_to_{name}_{target_id}") for name in CHANNELS_CONFIG.keys()]
+            markup.add(*buttons, types.InlineKeyboardButton("❌ Отмена", callback_data="pub_cancel"))
+            bot.send_message(
+                chat_id,
+                f"💬 <b>Оплата одобрена! Пожелание пользователя по времени:</b>\n«<code>{desired}</code>»\n\nВыберите канал для публикации:",
+                message_thread_id=call.message.message_thread_id,
+                reply_markup=markup,
+                parse_mode='HTML'
+            )
         else:
             try:
                 bot.edit_message_text(f"❌ <b>Оплата отклонена.</b>", chat_id, call.message.message_id, parse_mode='HTML')
             except:
                 bot.send_message(chat_id, f"❌ <b>Оплата отклонена.</b>", parse_mode='HTML')
             bot.send_message(target_id, "❌ <b>Оплата не подтверждена.</b>", parse_mode='HTML')
+        return
+
+    if data.startswith("publish_now_to_"):
+        parts = data.replace("publish_now_to_", "").split("_")
+        category = parts[0]
+        target_id = parts[1]
+        
+        u_threads = load_json(DATA_FILE, {})
+        u_data = u_threads.get(target_id, {})
+        post_text = u_data.get("post_text", "")
+        post_photo = u_data.get("post_photo", None)
+        
+        config = CHANNELS_CONFIG.get(category)
+        if config and post_text:
+            target = config["channel"]
+            is_resume = (u_data.get("type") == "resume") or ("#резюме" in post_text.lower() or "резюме" in post_text.lower() or "| 🇷 🇪 🇸 🇺 🇲 🇪 |" in post_text)
+            final = format_post(post_text, category, is_resume=is_resume)
+            
+            try:
+                if post_photo:
+                    sent = bot.send_photo(target, post_photo, caption=final, parse_mode='HTML')
+                    message_id = sent.message_id
+                else:
+                    sent = bot.send_message(target, final, parse_mode='HTML', disable_web_page_preview=True)
+                    message_id = sent.message_id
+                    
+                category_id = CHANNEL_TO_CATEGORY.get(target)
+                if category_id:
+                    save_vacancy_to_both(final, category_id, target, message_id, f"https://t.me/{target[1:]}/{message_id}")
+                    
+                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML')
+            except Exception as e:
+                bot.answer_callback_query(call.id, f"Ошибка публикации: {e}")
+        else:
+            bot.answer_callback_query(call.id, "Ошибка: черновик не найден!")
+        return
+
+    if data == "pub_cancel":
+        try:
+            bot.edit_message_text("❌ Действие отменено.", chat_id, call.message.message_id)
+        except:
+            pass
         return
 
     if data == "adm_parser":
@@ -1797,6 +2229,8 @@ def callback_handler(call):
     elif data in ["vacancy", "resume", "admin_chat"]:
         user_threads[chat_id].update({"type": data, "state": "writing_text", "notified": False})
         save_json(DATA_FILE, user_threads)
+        if data in ["vacancy", "resume"]:
+            update_topic_marker(chat_id, "🟡")
         txt = current_settings.get(f"txt_{data}_instr" if data != "admin_chat" else "txt_admin_chat")
         try:
             bot.edit_message_text(txt, chat_id, call.message.message_id, reply_markup=get_nav_menu("main_menu"), parse_mode='HTML')
@@ -1890,79 +2324,168 @@ def save_blocked_user_reason(message):
 
 # ==================== КОНЕЦ ДОБАВЛЕНИЯ В ЧС ====================
 
-# Обработка текстовых сообщений от админа
-@bot.message_handler(func=lambda m: (m.from_user.id in ADMIN_IDS) and (pending_contacts or pending_edits))
-def handle_admin_text(message):
+def get_matching_pending_action(message):
+    if not message.from_user:
+        return None
+        
     chat_id = str(message.chat.id)
+    thread_id = getattr(message, 'message_thread_id', None)
+    admin_id = message.from_user.id
+    reply_to_id = message.reply_to_message.message_id if message.reply_to_message else None
     
-    # Сначала проверяем pending_edits
-    for original_msg_id, data in list(pending_edits.items()):
-        if data.get("user_id") == chat_id:
-            new_text = message.text
+    # 1. Проверяем pending_edits
+    for orig_id, data in list(pending_edits.items()):
+        is_allowed = (admin_id in ADMIN_IDS) or (data.get("admin_id") == admin_id)
+        if not is_allowed:
+            continue
+            
+        if reply_to_id and (reply_to_id == data.get("request_msg_id") or reply_to_id == orig_id):
+            return ('edit', orig_id, data)
+        if str(data.get("chat_id", data.get("user_id"))) == chat_id:
+            if thread_id is not None or data.get("thread_id") is not None:
+                if str(thread_id) == str(data.get("thread_id")):
+                    return ('edit', orig_id, data)
+            else:
+                return ('edit', orig_id, data)
+
+    # 2. Проверяем pending_contacts
+    for orig_id, data in list(pending_contacts.items()):
+        is_allowed = (admin_id in ADMIN_IDS) or (data.get("admin_id") == admin_id)
+        if not is_allowed:
+            continue
+            
+        if reply_to_id and (reply_to_id == data.get("request_msg_id") or reply_to_id == orig_id):
+            return ('contact', orig_id, data)
+        if str(data.get("chat_id", data.get("user_id"))) == chat_id:
+            if thread_id is not None or data.get("thread_id") is not None:
+                if str(thread_id) == str(data.get("thread_id")):
+                    return ('contact', orig_id, data)
+            else:
+                return ('contact', orig_id, data)
+
+    return None
+
+# Обработка текстовых сообщений от админа при вводе контакта или текста
+@bot.message_handler(func=lambda m: get_matching_pending_action(m) is not None, content_types=['text'])
+def handle_admin_text(message):
+    action_info = get_matching_pending_action(message)
+    if not action_info:
+        return
+        
+    action_type, original_msg_id, data = action_info
+    chat_id = message.chat.id
+    thread_id = getattr(message, 'message_thread_id', None)
+    target_chat_id = int(data.get("chat_id", data.get("user_id", SUPER_GROUP_ID)))
+    
+    # Отмена действия
+    if message.text and message.text.strip().lower() in ['/cancel', 'отмена']:
+        if action_type == 'edit' and original_msg_id in pending_edits:
+            del pending_edits[original_msg_id]
+        elif action_type == 'contact' and original_msg_id in pending_contacts:
+            del pending_contacts[original_msg_id]
+        try:
+            if data.get("request_msg_id"):
+                bot.delete_message(chat_id, data.get("request_msg_id"))
+        except: pass
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except: pass
+        bot.send_message(chat_id, "❌ Действие отменено.", message_thread_id=thread_id)
+        return
+
+    if action_type == 'edit':
+        new_body = message.html_text or message.html_caption or message.text
+        contact = data.get("contact", "Не указан")
+        updated_text = balance_html_tags(build_updated_vacancy_text(new_body, contact))
+        
+        try:
             try:
                 bot.edit_message_text(
-                    new_text,
-                    SUPER_GROUP_ID,
+                    updated_text,
+                    target_chat_id,
                     original_msg_id,
                     parse_mode='HTML',
                     reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"))
                 )
-                bot.send_message(chat_id, "✅ Текст сообщения изменен!")
-                try:
-                    bot.delete_message(chat_id, data.get("request_msg_id"))
-                except Exception as e:
-                    print(f"⚠️ Не удалось удалить сообщение запроса: {e}")
-                del pending_edits[original_msg_id]
             except Exception as e:
-                error_msg = str(e)
-                print(f"❌ Ошибка при изменении текста: {error_msg}")
-                bot.send_message(chat_id, f"❌ Ошибка: {error_msg}")
-            return
+                if "there is no text in the message" in str(e).lower():
+                    bot.edit_message_caption(
+                        caption=updated_text,
+                        chat_id=target_chat_id,
+                        message_id=original_msg_id,
+                        parse_mode='HTML',
+                        reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"))
+                    )
+                else:
+                    raise e
+                    
+            bot.send_message(chat_id, "✅ Текст сообщения изменен!", message_thread_id=thread_id)
+            try:
+                if data.get("request_msg_id"):
+                    bot.delete_message(chat_id, data.get("request_msg_id"))
+            except Exception as e:
+                print(f"⚠️ Не удалось удалить сообщение запроса: {e}")
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except: pass
+            if original_msg_id in pending_edits:
+                del pending_edits[original_msg_id]
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Ошибка при изменении текста: {error_msg}")
+            bot.send_message(chat_id, f"❌ Ошибка: {error_msg}", message_thread_id=thread_id)
+        return
 
-    for original_msg_id, data in list(pending_contacts.items()):
-        if data.get("user_id") == chat_id:
-            contact_input = message.text.strip()
-            if contact_input.startswith('@'):
-                username = contact_input[1:]
-            elif 't.me/' in contact_input:
-                username = contact_input.split('t.me/')[-1]
-            else:
-                username = contact_input
-            formatted_contact = f"@{username}"
-            original_text = data["original_text"]
-            contact_marker = "Контакт для связи:"
-            next_marker = "Для публикации вакансии"
-            contact_pos = original_text.find(contact_marker)
-            next_pos = original_text.find(next_marker, contact_pos)
-            if contact_pos != -1 and next_pos != -1:
-                after_marker = contact_pos + len(contact_marker)
-                before = original_text[:after_marker]
-                after = original_text[next_pos:]
-                updated_text = f"{before}\n{formatted_contact}\n\n{after}"
-            else:
-                updated_text = original_text.replace(
-                    "<i>⚠️ Контакт не найден (укажите @username или добавьте контакт в текст)</i>",
-                    formatted_contact
-                )
+    elif action_type == 'contact':
+        contact_input = message.text.strip()
+        body, _ = extract_body_and_contact(data.get("original_text", ""))
+        updated_text = balance_html_tags(build_updated_vacancy_text(body, contact_input))
+        
+        clean_c = contact_input
+        if clean_c.startswith('@') or clean_c.startswith('http'):
+            formatted_contact = clean_c
+        elif 't.me/' in clean_c:
+            formatted_contact = f"@{clean_c.split('t.me/')[-1]}"
+        else:
+            formatted_contact = f"@{clean_c}"
+
+        try:
             try:
                 bot.edit_message_text(
                     updated_text,
-                    SUPER_GROUP_ID,
+                    target_chat_id,
                     original_msg_id,
                     parse_mode='HTML',
                     reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"))
                 )
-                bot.send_message(chat_id, f"✅ Контакт {formatted_contact} добавлен!")
-                try:
-                    bot.delete_message(chat_id, data.get("request_msg_id"))
-                except Exception as e:
-                    print(f"⚠️ Не удалось удалить сообщение запроса: {e}")
-                del pending_contacts[original_msg_id]
             except Exception as e:
-                error_msg = str(e)
-                print(f"❌ Ошибка при обновлении: {error_msg}")
-                bot.send_message(chat_id, f"❌ Ошибка: {error_msg}")
-            return
+                if "there is no text in the message" in str(e).lower():
+                    bot.edit_message_caption(
+                        caption=updated_text,
+                        chat_id=target_chat_id,
+                        message_id=original_msg_id,
+                        parse_mode='HTML',
+                        reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"))
+                    )
+                else:
+                    raise e
+                    
+            bot.send_message(chat_id, f"✅ Контакт {formatted_contact} добавлен!", message_thread_id=thread_id)
+            try:
+                if data.get("request_msg_id"):
+                    bot.delete_message(chat_id, data.get("request_msg_id"))
+            except Exception as e:
+                print(f"⚠️ Не удалось удалить сообщение запроса: {e}")
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except: pass
+            if original_msg_id in pending_contacts:
+                del pending_contacts[original_msg_id]
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Ошибка при обновлении контакта: {error_msg}")
+            bot.send_message(chat_id, f"❌ Ошибка: {error_msg}", message_thread_id=thread_id)
+        return
 
 # Обработчики для шагов добавления
 def save_recommend_button_text(message):
@@ -2125,9 +2648,10 @@ def commands_handler(message):
     if chat_id not in user_threads or not user_threads[chat_id].get("thread_id"):
         try:
             user_name = message.from_user.first_name or "User"
-            topic = bot.create_forum_topic(SUPER_GROUP_ID, f"{user_name} ({chat_id})")
+            topic = bot.create_forum_topic(SUPER_GROUP_ID, f"🔵 {user_name} ({chat_id})")
             user_threads[chat_id] = {
                 "thread_id": topic.message_thread_id, 
+                "user_name": user_name,
                 "type": "chat", 
                 "state": None, 
                 "notified": False,
@@ -2154,22 +2678,34 @@ def commands_handler(message):
                          reply_markup=get_reply_main_menu(), parse_mode='HTML')
         bot.send_message(chat_id, "Выберите действие:", reply_markup=get_main_menu())
 
-@bot.message_handler(func=lambda m: m.chat.id == SUPER_GROUP_ID and m.reply_to_message is not None)
+@bot.message_handler(func=lambda m: str(m.chat.id) == str(SUPER_GROUP_ID) and m.message_thread_id is not None, content_types=['text', 'photo', 'video', 'document', 'animation'])
 def handle_admin_reply(message):
+    # Не пересылаем сообщения самого бота
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    # Фильтруем команды, чтобы они не улетали пользователю
+    if message.text:
+        cleaned = message.text.strip().lower()
+        if cleaned.startswith('/'):
+            return
+            
     user_threads = load_json(DATA_FILE, {})
-    target_id = next((u for u, d in user_threads.items() if d.get("thread_id") == message.message_thread_id), None)
+    target_id = next((u for u, d in user_threads.items() if d.get("thread_id") is not None and str(d.get("thread_id")) == str(message.message_thread_id)), None)
     if target_id:
-        try: bot.copy_message(target_id, message.chat.id, message.message_id)
-        except: pass
+        try:
+            bot.copy_message(int(target_id), message.chat.id, message.message_id)
+        except Exception as e:
+            print(f"⚠️ Ошибка при отправке ответа пользователю: {e}")
+        update_topic_marker(target_id, "🟣")
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private', content_types=['text', 'photo', 'video', 'document', 'animation'])
 def handle_user_messages(message):
     chat_id = str(message.chat.id)
-    if (message.from_user.id in ADMIN_IDS) and (pending_contacts or pending_edits):
-        for original_msg_id, data in {**pending_contacts, **pending_edits}.items():
-            if data.get("user_id") == chat_id:
-                handle_admin_text(message)
-                return
+    action_info = get_matching_pending_action(message)
+    if action_info:
+        handle_admin_text(message)
+        return
     if message.text == "🏠 Главное меню":
         bot.clear_step_handler_by_chat_id(chat_id)
         user_threads = load_json(DATA_FILE, {})
@@ -2189,14 +2725,22 @@ def handle_user_messages(message):
         return
     if not user_data.get("thread_id"):
         try:
-            topic = bot.create_forum_topic(SUPER_GROUP_ID, f"{message.from_user.first_name}")
+            user_name = message.from_user.first_name or "User"
+            topic = bot.create_forum_topic(SUPER_GROUP_ID, f"🔵 {user_name} ({chat_id})")
             user_data["thread_id"] = topic.message_thread_id
+            user_data["user_name"] = user_name
             save_json(DATA_FILE, user_threads)
         except: return
     if user_data.get("type") in ["vacancy", "resume"] and user_data.get("state") == "writing_text":
         label = "💼 <b>ВАКАНСИЯ</b>" if user_data["type"] == "vacancy" else "👤 <b>РЕЗЮМЕ</b>"
         bot.send_message(SUPER_GROUP_ID, label, message_thread_id=user_data["thread_id"], parse_mode='HTML')
-        bot.copy_message(SUPER_GROUP_ID, chat_id, message.message_id, message_thread_id=user_data["thread_id"], reply_markup=get_user_info_btn(chat_id))
+        copied_msg = bot.copy_message(SUPER_GROUP_ID, chat_id, message.message_id, message_thread_id=user_data["thread_id"], reply_markup=get_user_info_btn(chat_id))
+        
+        # Сохраняем черновик
+        user_threads[chat_id]["post_text"] = message.text or message.caption or ""
+        user_threads[chat_id]["post_photo"] = message.photo[-1].file_id if message.photo else None
+        user_threads[chat_id]["post_msg_id"] = copied_msg.message_id
+        
         user_threads[chat_id]["state"] = "writing_time"
         save_json(DATA_FILE, user_threads)
         wait_time_text = current_settings.get("txt_wait_time", "Напишите время публикации:")
@@ -2208,6 +2752,7 @@ def handle_user_messages(message):
             bot.send_message(chat_id, "✅ Сообщение отправлено.")
             user_threads[chat_id]["notified"] = True
             save_json(DATA_FILE, user_threads)
+        update_topic_marker(chat_id, "🔴")
     check_and_send_ad(chat_id)
 
 if __name__ == "__main__":

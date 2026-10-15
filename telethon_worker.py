@@ -102,6 +102,147 @@ def apply_filters(text):
     text = text.strip()
     return text
 
+# ==================== ЧЁРНЫЙ СПИСОК ====================
+def is_contact_scammy(username):
+    if not username:
+        return False
+    username_lower = username.strip().lower().replace("@", "")
+    
+    # 1. Слишком длинные имена с хаотичным набором символов (типично для одноразовых ботов-скамеров)
+    if len(username_lower) > 15:
+        digits = sum(c.isdigit() for c in username_lower)
+        consonants = sum(c in 'bcdfghjklmnpqrstvwxyz' for c in username_lower)
+        if digits > 5 or consonants > 10:
+            return True
+
+    # 2. Подозрительные паттерны, часто используемые в скам-сетях
+    scam_keywords = [
+        "zarabotok", "invest", "crypto", "vlozheniy", "dohod", "easy_money", "p2p", "arbitrazh",
+        "rabota_online", "rabotavsem", "podrabotka_bot", "job_bot", "work_bot", "money_bot"
+    ]
+    for kw in scam_keywords:
+        if kw in username_lower:
+            return True
+            
+    return False
+
+def balance_html_tags(html):
+    """Добавляет недостающие закрывающие теги в HTML-строку"""
+    if not html:
+        return ""
+    
+    tag_pattern = re.compile(r'<(/?)([a-zA-Z1-6]+)(?:\s+[^>]*?)?>')
+    open_tags = []
+    void_tags = {'img', 'br', 'hr', 'input', 'meta', 'link'}
+    
+    for match in tag_pattern.finditer(html):
+        is_closing = bool(match.group(1))
+        tag_name = match.group(2).lower()
+        if tag_name in void_tags:
+            continue
+        if not is_closing:
+            open_tags.append(tag_name)
+        else:
+            if open_tags and open_tags[-1] == tag_name:
+                open_tags.pop()
+            elif tag_name in open_tags:
+                while open_tags:
+                    popped = open_tags.pop()
+                    if popped == tag_name:
+                        break
+                        
+    for tag in reversed(open_tags):
+        html += f"</{tag}>"
+    return html
+
+def is_user_blocked(user_id=None, username=None):
+    """Проверить, заблокирован ли пользователь или канал по ID или по @username"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=30.0)
+        cursor = conn.cursor()
+        
+        ids = []
+        usernames = []
+        
+        def process_input(val):
+            if not val:
+                return
+            s = str(val).strip()
+            if not s:
+                return
+                
+            if 'tg://user?id=' in s:
+                pid = s.split('tg://user?id=')[-1].split('&')[0]
+                if pid.isdigit():
+                    ids.append(int(pid))
+                    return
+            
+            if 't.me/' in s:
+                part = s.split('t.me/')[-1].split('?')[0]
+                parts = [p for p in part.split('/') if p]
+                if parts:
+                    u = parts[0]
+                    if u == 'c' and len(parts) > 1:
+                        pid = parts[1]
+                        if pid.isdigit():
+                            ids.append(int(pid))
+                    elif u != 'c' and u != '+' and not u.startswith('joinchat'):
+                        usernames.append(u.replace('@', '').lower())
+                return
+                
+            if s.startswith('@'):
+                usernames.append(s[1:].lower())
+                return
+                
+            if s.lstrip('-').isdigit():
+                ids.append(int(s))
+                return
+                
+            usernames.append(s.replace('@', '').lower())
+            
+        process_input(user_id)
+        process_input(username)
+        
+        if ids:
+            candidates = []
+            for item in ids:
+                s_id = str(item)
+                candidates.append(s_id)
+                abs_val = abs(item)
+                if str(abs_val).startswith('100'):
+                    raw_id = str(abs_val)[3:]
+                    candidates.extend([raw_id, f"-{raw_id}", f"-100{raw_id}", str(abs_val), f"-{abs_val}"])
+                else:
+                    candidates.extend([str(abs_val), f"-{abs_val}", f"-100{abs_val}"])
+            
+            candidates = list(set(candidates))
+            placeholders = ','.join('?' for _ in candidates)
+            cursor.execute(f"SELECT 1 FROM blocked_users WHERE user_id IN ({placeholders})", candidates)
+            if cursor.fetchone():
+                conn.close()
+                return True
+                
+        if usernames:
+            for u in list(usernames):
+                usernames.append(f"@{u}")
+            usernames = list(set(usernames))
+            
+            for u in usernames:
+                cursor.execute(
+                    "SELECT 1 FROM blocked_users WHERE LOWER(username) = ? OR LOWER(user_id) = ?",
+                    (u.lower(), u.lower())
+                )
+                if cursor.fetchone():
+                    conn.close()
+                    return True
+                    
+        conn.close()
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка проверки ЧС: {e}")
+        return False
+# ==================== КОНЕЦ ЧЁРНОГО СПИСКА ====================
+
 # ==================== КОНВЕРТАЦИЯ MARKDOWN → HTML ====================
 
 def markdown_to_html(text):
@@ -138,15 +279,7 @@ def markdown_to_html(text):
 def send_to_moderation(chat_id, thread_id, text, author_id=None, message_link=None, is_special=False):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     
-    if is_special:
-        keyboard = [[{"text": "⏳ Загрузка...", "callback_data": "loading"}]]
-    else:
-        keyboard = [
-            [{"text": "✅ Опубликовать", "callback_data": "pub_approve"},
-             {"text": "❌ Отклонить", "callback_data": "pub_decline"}]
-        ]
-        if message_link:
-            keyboard.append([{"text": "🔗 Источник", "url": message_link}])
+    keyboard = [[{"text": "⏳ Загрузка...", "callback_data": "loading"}]]
     
     payload = {
         "chat_id": chat_id,
@@ -162,7 +295,7 @@ def send_to_moderation(chat_id, thread_id, text, author_id=None, message_link=No
         r = requests.post(url, json=payload, timeout=10)
         res = r.json()
         
-        if res.get("ok") and is_special:
+        if res.get("ok"):
             msg_id = res.get("result", {}).get("message_id")
             if msg_id:
                 update_url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageReplyMarkup"
@@ -170,6 +303,7 @@ def send_to_moderation(chat_id, thread_id, text, author_id=None, message_link=No
                 if message_link:
                     buttons.append({"text": "🔗 Источник", "url": message_link})
                 buttons.append({"text": "✏️ Ввести контакт", "callback_data": f"edit_contact_{msg_id}"})
+                buttons.append({"text": "✏️ Редактировать", "callback_data": f"edit_text_{msg_id}"})
                 buttons.append({"text": "✅ Опубликовать", "callback_data": f"pub_approve_special_{msg_id}"})
                 buttons.append({"text": "❌ Отклонить", "callback_data": f"pub_decline_special_{msg_id}"})
                 keyboard_rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
@@ -179,7 +313,7 @@ def send_to_moderation(chat_id, thread_id, text, author_id=None, message_link=No
                     "reply_markup": {"inline_keyboard": keyboard_rows}
                 }
                 requests.post(update_url, json=update_payload, timeout=10)
-                print(f"✅ Кнопки для особого чата обновлены (message_id: {msg_id})")
+                print(f"✅ Кнопки модерации обновлены (message_id: {msg_id})")
         
         if not res.get("ok"):
             print(f"❌ Ошибка Telegram API: {res.get('description')}")
@@ -211,18 +345,8 @@ async def process_message(message):
         channels_db, keywords, stop_words = get_data_from_db()
         msg_text_lower = content.lower()
         
-        is_target = False
-        cid_full = str(PROBLEM_CHAT_ID)
-        cid_short = cid_full.replace("-100", "")
-        
-        for conf in channels_db:
-            clean_conf = conf.replace('https://t.me/', '').replace('http://t.me/', '').replace('@', '').strip()
-            if (clean_conf == cid_full) or (clean_conf == cid_short):
-                is_target = True
-                break
-        
-        if not is_target:
-            return
+        # Поскольку этот воркер опрашивает ТОЛЬКО PROBLEM_CHAT_ID, этот чат всегда является целевым!
+        is_target = True
         
         for stop_word in stop_words:
             if stop_word and stop_word in msg_text_lower:
@@ -270,6 +394,31 @@ async def process_message(message):
         if is_special and not has_username:
             contact = "<i>⚠️ Контакт не найден (укажите @username или добавьте контакт в текст)</i>"
         
+        # ========== ПРОВЕРКА ЧЁРНОГО СПИСКА И СКАМА ==========
+        clean_contact = contact.replace('@', '').strip() if contact and "⚠️" not in contact and contact != "Не указан" else None
+        sender_username = sender.username if (sender and hasattr(sender, 'username')) else None
+        
+        # 1. Проверяем автора по ID
+        if author_id and is_user_blocked(user_id=author_id):
+            print(f"🚫 Пропущено: отправитель ID {author_id} в ЧС")
+            return
+            
+        # 2. Проверяем юзернейм автора
+        if sender_username and is_user_blocked(username=sender_username):
+            print(f"🚫 Пропущено: отправитель @{sender_username} в ЧС")
+            return
+            
+        # 3. Проверяем извлеченный контакт для связи в ЧС
+        if clean_contact and is_user_blocked(username=clean_contact):
+            print(f"🚫 Пропущено: контакт для связи @{clean_contact} в ЧС")
+            return
+            
+        # 4. Проверяем контакт на эвристические признаки скама
+        if clean_contact and is_contact_scammy(clean_contact):
+            print(f"🚫 Пропущено: контакт @{clean_contact} определен как СКАМ (эвристика)")
+            return
+        # ====================================================
+
         # ========== КОНВЕРТИРУЕМ MARKDOWN → HTML ==========
         content = markdown_to_html(content)
         # =================================================
@@ -285,11 +434,11 @@ async def process_message(message):
             contact_block = f"<b>Контакт для связи:</b>\n{contact}\n\n"
         
         instruction = (
-            "<b><code>Для публикации вакансии\\резюме, напишите заявку в </code>"
+            "<b>Для публикации вакансии\\резюме, напишите заявку в "
             "<a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
         )
         tags = "\n\n#вакансия #парсер"
-        pretty_text = f"{header}{body_html}\n\n{contact_block}{instruction}{tags}"
+        pretty_text = balance_html_tags(f"{header}{body_html}\n\n{contact_block}{instruction}{tags}")
         
         message_link = None
         if str(PROBLEM_CHAT_ID).startswith("-100"):
