@@ -1,0 +1,4 @@
+https://github.com/kurimuzonakuma/pyrogram/archive/v2.1.25.zip
+telebot
+requests
+telethon
