@@ -1,0 +1,6 @@
+{
+  "name": "GetJob Bot & Parser Manager",
+  "description": "Telegram vacancy and resume parser, moderation panel and recruitment bot manager.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

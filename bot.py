@@ -9,6 +9,17 @@ import requests
 from dotenv import load_dotenv
 import threading
 import time
+from smart_filter import (
+    balance_html_tags,
+    strip_html_links_keep_formatting,
+    strip_tech_comment,
+    add_blocked_user_smart,
+    is_user_blocked_smart,
+    normalize_identifier,
+    get_smart_filter_settings,
+    toggle_tech_comment,
+    toggle_live_mode,
+)
 
 load_dotenv()
 
@@ -70,50 +81,24 @@ def check_menu_escape(message):
         return True
     return False
 
-def balance_html_tags(html):
-    """Добавляет недостающие закрывающие теги в HTML-строку"""
-    if not html:
-        return ""
-    
-    tag_pattern = re.compile(r'<(/?)([a-zA-Z1-6]+)(?:\s+[^>]*?)?>')
-    open_tags = []
-    void_tags = {'img', 'br', 'hr', 'input', 'meta', 'link'}
-    
-    for match in tag_pattern.finditer(html):
-        is_closing = bool(match.group(1))
-        tag_name = match.group(2).lower()
-        if tag_name in void_tags:
-            continue
-        if not is_closing:
-            open_tags.append(tag_name)
-        else:
-            if open_tags and open_tags[-1] == tag_name:
-                open_tags.pop()
-            elif tag_name in open_tags:
-                while open_tags:
-                    popped = open_tags.pop()
-                    if popped == tag_name:
-                        break
-                        
-    for tag in reversed(open_tags):
-        html += f"</{tag}>"
-    return html
-
 # --- ФУНКЦИЯ ОЧИСТКИ ТЕКСТА ВАКАНСИИ ---
 def clean_vacancy_text(text):
-    """Удаляет шапку, контакт, инструкцию и хэштеги, оставляя чистый текст вакансии"""
-    text = re.sub(r'^\| 🇻 🇦 🇨 🇦 🇳 🇨 🇾 \|\n*\n*', '', text)
-    text = re.sub(r'\n*Контакт для связи:.*?\n*\n*', '\n', text, flags=re.DOTALL)
+    """Удаляет шапку, тех. коммент, контакт, инструкцию и хэштеги, оставляя чистый текст вакансии"""
+    text = strip_tech_comment(text)
+    text = re.sub(r'^<b>\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\s*</b>\n*\n*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\n*\n*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\n*(?:<b>)?Контакт для связи:(?:</b>)?.*?\n*\n*', '\n', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'\n*(<b><code>Для публикации|<b>Для публикации|Для публикации).*?</a></b>\n*', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'\n*#вакансия\s*#парсер\s*$', '', text)
-    text = re.sub(r'\n*#вакансия\s*#\w+\s*$', '', text)
+    text = re.sub(r'\n*#вакансия\s*#парсер\s*$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\n*#вакансия\s*#\w+\s*$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 def extract_body_and_contact(orig_text):
     if not orig_text:
         return "", "Не указан"
-    body = orig_text.strip()
+    body = strip_tech_comment(orig_text.strip())
     # Удаляем шапку вакансии (с тегами <b> или без них)
     body = re.sub(r'^\s*<b>\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|\s*</b>', '', body, flags=re.IGNORECASE)
     body = re.sub(r'^\s*\|\s*🇻\s*🇦\s*🇨\s*🇦\s*🇳\s*🇨\s*🇾\s*\|', '', body, flags=re.IGNORECASE)
@@ -142,7 +127,7 @@ def extract_body_and_contact(orig_text):
     body = re.sub(r'\n*#вакансия\s*#парсер\s*$', '', body, flags=re.IGNORECASE)
     body = re.sub(r'\n*#[a-zA-Zа-яА-ЯёЁ0-9_]+\s*$', '', body)
     
-    return body.strip(), contact.strip()
+    return strip_html_links_keep_formatting(body.strip()), contact.strip()
 
 def build_updated_vacancy_text(body, contact):
     header = "<b>| 🇻 🇦 🇨 🇦 🇳 🇨 🇾 |</b>\n\n"
@@ -163,8 +148,8 @@ def build_updated_vacancy_text(body, contact):
         "<a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
     )
     tags = "\n\n#вакансия #парсер"
-    balanced_body = balance_html_tags(body)
-    return f"{header}{balanced_body}\n\n{contact_block}{instruction}{tags}"
+    clean_body = strip_html_links_keep_formatting(strip_tech_comment(body))
+    return f"{header}{clean_body}\n\n{contact_block}{instruction}{tags}"
 
 # ==================== ФИЛЬТРЫ ТЕКСТА ====================
 
@@ -255,47 +240,18 @@ def get_blocked_users():
 
 def add_blocked_user(user_id, username=None, reason=None):
     """Добавить пользователя в чёрный список"""
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=30.0)
-        cursor = conn.cursor()
-        
-        # Нормализуем username
-        clean_username = None
-        if username:
-            clean_username = str(username).strip().replace('@', '').lower()
-            
-        # Нормализуем user_id
-        clean_user_id = str(user_id).strip()
-        if not clean_user_id.lstrip('-').isdigit():
-            clean_user_id = clean_user_id.replace('@', '').lower()
-            
-        # Проверяем, существует ли уже такая запись
-        cursor.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (clean_user_id,))
-        if cursor.fetchone():
-            conn.close()
-            return False # Уже существует
-            
-        cursor.execute(
-            "INSERT INTO blocked_users (user_id, username, reason) VALUES (?, ?, ?)",
-            (clean_user_id, clean_username, reason)
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка добавления в ЧС: {e}")
-        return False
+    return add_blocked_user_smart(user_id=user_id, username=username, reason=reason)
 
 def remove_blocked_user(user_id):
     """Удалить пользователя из чёрного списка"""
     try:
         conn = sqlite3.connect(DB_FILE, timeout=30.0)
         cursor = conn.cursor()
-        clean_user_id = str(user_id).strip()
-        if not clean_user_id.lstrip('-').isdigit():
-            clean_user_id = clean_user_id.replace('@', '').lower()
-            
-        cursor.execute("DELETE FROM blocked_users WHERE user_id = ? OR LOWER(username) = ?", (clean_user_id, clean_user_id))
+        clean_val = str(user_id).strip().lstrip('@').lower()
+        cursor.execute(
+            "DELETE FROM blocked_users WHERE LOWER(user_id) = ? OR LOWER(username) = ? OR user_id = ?",
+            (clean_val, clean_val, str(user_id).strip())
+        )
         conn.commit()
         conn.close()
         return True
@@ -305,126 +261,24 @@ def remove_blocked_user(user_id):
 
 def is_user_blocked(user_id=None, username=None):
     """Проверить, заблокирован ли пользователь или канал по ID или по @username"""
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=30.0)
-        cursor = conn.cursor()
-        
-        ids = []
-        usernames = []
-        
-        def process_input(val):
-            if not val:
-                return
-            s = str(val).strip()
-            if not s:
-                return
-                
-            if 'tg://user?id=' in s:
-                pid = s.split('tg://user?id=')[-1].split('&')[0]
-                if pid.isdigit():
-                    ids.append(int(pid))
-                    return
-            
-            if 't.me/' in s:
-                part = s.split('t.me/')[-1].split('?')[0]
-                parts = [p for p in part.split('/') if p]
-                if parts:
-                    u = parts[0]
-                    if u == 'c' and len(parts) > 1:
-                        pid = parts[1]
-                        if pid.isdigit():
-                            ids.append(int(pid))
-                    elif u != 'c' and u != '+' and not u.startswith('joinchat'):
-                        usernames.append(u.replace('@', '').lower())
-                return
-                
-            if s.startswith('@'):
-                usernames.append(s[1:].lower())
-                return
-                
-            if s.lstrip('-').isdigit():
-                ids.append(int(s))
-                return
-                
-            usernames.append(s.replace('@', '').lower())
-            
-        process_input(user_id)
-        process_input(username)
-        
-        if ids:
-            candidates = []
-            for item in ids:
-                s_id = str(item)
-                candidates.append(s_id)
-                abs_val = abs(item)
-                if str(abs_val).startswith('100'):
-                    raw_id = str(abs_val)[3:]
-                    candidates.extend([raw_id, f"-{raw_id}", f"-100{raw_id}", str(abs_val), f"-{abs_val}"])
-                else:
-                    candidates.extend([str(abs_val), f"-{abs_val}", f"-100{abs_val}"])
-            
-            candidates = list(set(candidates))
-            placeholders = ','.join('?' for _ in candidates)
-            cursor.execute(f"SELECT 1 FROM blocked_users WHERE user_id IN ({placeholders})", candidates)
-            if cursor.fetchone():
-                conn.close()
-                return True
-                
-        if usernames:
-            for u in list(usernames):
-                usernames.append(f"@{u}")
-            usernames = list(set(usernames))
-            
-            for u in usernames:
-                cursor.execute(
-                    "SELECT 1 FROM blocked_users WHERE LOWER(username) = ? OR LOWER(user_id) = ?",
-                    (u.lower(), u.lower())
-                )
-                if cursor.fetchone():
-                    conn.close()
-                    return True
-                    
-        conn.close()
-        return False
-    except Exception as e:
-        print(f"❌ Ошибка проверки ЧС: {e}")
-        return False
+    return is_user_blocked_smart(user_id=user_id, username=username)
 
 def parse_user_input(text):
     """Парсит ввод пользователя: ID, @username, ссылка"""
+    if not text:
+        return None, None
     text = text.strip()
     if not text:
         return None, None
-        
-    # Если это ссылка на профиль или сообщение
-    if 't.me/' in text:
-        part = text.split('t.me/')[-1]
-        part = part.split('?')[0] # Убираем параметры
-        parts = [p for p in part.split('/') if p]
-        if parts:
-            username = parts[0]
-            # Если это приватный канал/чат в формате t.me/c/12345/678
-            if username == 'c' and len(parts) > 1:
-                possible_id = parts[1]
-                if possible_id.isdigit():
-                    val = int(possible_id)
-                    if str(val).startswith('100'):
-                        return -val, None
-                    else:
-                        return int(f"-100{val}"), None
-            # Для публичных ссылок
-            return None, username.strip().replace('@', '')
-            
-    # Если это @username
-    if text.startswith('@'):
-        return None, text[1:].strip()
-        
-    # Если это число (ID)
-    if text.lstrip('-').isdigit():
-        return int(text), None
-        
-    # Если это просто username без @
-    return None, text.strip()
+
+    # Предотвращаем случайный бан исходного чата при вставке ссылки на сообщение t.me/c/123456/789
+    if re.search(r't\.me/c/\d+/\d+', text, flags=re.IGNORECASE):
+        return "CHAT_MSG_LINK", None
+
+    uid, uname = normalize_identifier(text)
+    if uid and uid.lstrip('-').isdigit():
+        return int(uid), uname
+    return None, uname
 
 # ==================== КОНЕЦ ЧЁРНОГО СПИСКА ====================
 
@@ -904,12 +758,17 @@ def get_user_info_btn(user_id):
 def get_admin_panel_markup():
     markup = types.InlineKeyboardMarkup(row_width=1)
     log_status = "✅ Логи: ВКЛ" if current_settings.get("logging_enabled", True) else "❌ Логи: ВЫКЛ"
+    sf = get_smart_filter_settings()
+    comment_btn = "💬 Тех. коммент (тест): 🟢 ВКЛ" if sf["tech_comment_enabled"] else "💬 Тех. коммент (тест): 🔴 ВЫКЛ"
+    live_btn = "🚀 Умный фильтр в бою: 🟢 ВКЛ" if sf["live_mode_enabled"] else "🧪 Умный фильтр: ТЕСТОВЫЙ РЕЖИМ"
     markup.add(
         types.InlineKeyboardButton("💰 ЦЕНЫ", callback_data="adm_prices"),
         types.InlineKeyboardButton("💳 РЕКВИЗИТЫ", callback_data="adm_pay"),
         types.InlineKeyboardButton("📝 ТЕКСТЫ", callback_data="adm_texts"),
         types.InlineKeyboardButton("📢 УПР. РЕКЛАМОЙ (ПЛАШКИ)", callback_data="adm_ads"),
         types.InlineKeyboardButton("📡 УПРАВЛЕНИЕ ПАРСЕРОМ", callback_data="adm_parser"),
+        types.InlineKeyboardButton(comment_btn, callback_data="toggle_sf_comment_adm"),
+        types.InlineKeyboardButton(live_btn, callback_data="toggle_sf_live_adm"),
         types.InlineKeyboardButton("⭐ УПРАВЛЕНИЕ РЕКОМЕНДАЦИЯМИ", callback_data="adm_recommends"),
         types.InlineKeyboardButton("🛠️ ФИЛЬТРЫ ТЕКСТА", callback_data="adm_filters"),
         types.InlineKeyboardButton("🛡️ ЧЁРНЫЙ СПИСОК", callback_data="adm_blocklist"),
@@ -992,11 +851,16 @@ def get_admin_ad_markup():
 
 def get_parser_menu():
     markup = types.InlineKeyboardMarkup(row_width=1)
+    sf = get_smart_filter_settings()
+    comment_btn = "💬 Тех. коммент (тест): 🟢 ВКЛ" if sf["tech_comment_enabled"] else "💬 Тех. коммент (тест): 🔴 ВЫКЛ"
+    live_btn = "🚀 Умный фильтр в бою: 🟢 ВКЛ (Блокирует)" if sf["live_mode_enabled"] else "🧪 Умный фильтр в бою: 🔴 ВЫКЛ (Тест)"
     markup.add(
         types.InlineKeyboardButton("📢 КАНАЛЫ (Источники)", callback_data="parser_channels"),
         types.InlineKeyboardButton("🔑 КЛЮЧЕВЫЕ СЛОВА", callback_data="parser_keywords"),
         types.InlineKeyboardButton("🚫 СТОП-СЛОВА", callback_data="parser_stop_words"),
         types.InlineKeyboardButton("🔧 ОСОБЫЕ ЧАТЫ", callback_data="parser_special_chats"),
+        types.InlineKeyboardButton(comment_btn, callback_data="toggle_sf_comment"),
+        types.InlineKeyboardButton(live_btn, callback_data="toggle_sf_live"),
         types.InlineKeyboardButton("🔙 Назад в админку", callback_data="admin_panel")
     )
     return markup
@@ -1094,30 +958,38 @@ def get_moderator_decision_markup(user_id):
     )
     return markup
 
-def get_special_moderation_markup(message_id, message_link=None):
+def get_special_moderation_markup(message_id, message_link=None, author_id=0):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
+    top_row = []
+    if message_link:
+        top_row.append(types.InlineKeyboardButton("🔗 Источник", url=message_link))
+    top_row.append(types.InlineKeyboardButton("🚫 В ЧС", callback_data=f"ban_mod_{message_id}_{author_id or 0}"))
+    markup.row(*top_row)
+    markup.row(
         types.InlineKeyboardButton("✏️ Ввести контакт", callback_data=f"edit_contact_{message_id}"),
-        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}")
+    )
+    markup.row(
         types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub_approve_special_{message_id}"),
         types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pub_decline_special_{message_id}")
-    ]
-    if message_link:
-        buttons.insert(0, types.InlineKeyboardButton("🔗 Источник", url=message_link))
-    markup.add(*buttons)
+    )
     return markup
 
-def get_special_moderation_after_edit_markup(message_id, message_link=None):
+def get_special_moderation_after_edit_markup(message_id, message_link=None, author_id=0):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
+    top_row = []
+    if message_link:
+        top_row.append(types.InlineKeyboardButton("🔗 Источник", url=message_link))
+    top_row.append(types.InlineKeyboardButton("🚫 В ЧС", callback_data=f"ban_mod_{message_id}_{author_id or 0}"))
+    markup.row(*top_row)
+    markup.row(
         types.InlineKeyboardButton("🔄 Изменить контакт", callback_data=f"edit_contact_{message_id}"),
-        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}"),
+        types.InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_text_{message_id}")
+    )
+    markup.row(
         types.InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub_approve_special_{message_id}"),
         types.InlineKeyboardButton("❌ Отклонить", callback_data=f"pub_decline_special_{message_id}")
-    ]
-    if message_link:
-        buttons.insert(0, types.InlineKeyboardButton("🔗 Источник", url=message_link))
-    markup.add(*buttons)
+    )
     return markup
 
 # ==================== ФОРМАТИРОВАНИЕ ПОСТОВ ====================
@@ -1148,8 +1020,10 @@ def is_post_resume_by_context(post_text, thread_id=None):
     return False
 
 def format_post(post_text, category, is_resume=False):
+    # 0. Удаляем технический комментарий фильтра (если был включен режим теста)
+    clean = strip_tech_comment(post_text.strip())
+
     # 1. Очищаем текст от старых хэштегов в конце (рекурсивно снимаем все хэштеги с конца)
-    clean = post_text.strip()
     while True:
         prev_len = len(clean)
         clean = re.sub(r'#[a-zA-Zа-яА-ЯёЁ0-9_]+\s*$', '', clean).strip()
@@ -1176,7 +1050,10 @@ def format_post(post_text, category, is_resume=False):
         if len(clean_base) == prev_len:
             break
 
-    # 5. Применяем нужный заголовок и хэштеги в зависимости от типа поста
+    # 5. Удаляем вшитые ссылки из тела вакансии, сохраняя HTML-верстку (<b>, <i> и т.д.)
+    clean_base = strip_html_links_keep_formatting(clean_base)
+
+    # 6. Применяем нужный заголовок и хэштеги в зависимости от типа поста
     instr = "<b>Для публикации вакансии\\резюме, напишите заявку в <a href='https://t.me/Vakansii_GetJob_bot'>бота</a></b>"
     
     if is_resume:
@@ -1349,13 +1226,99 @@ def callback_handler(call):
         except: pass
         return
 
+    if data.startswith("ban_mod_"):
+        # Формат: ban_mod_{message_id}_{author_id}
+        parts = data.split("_")
+        author_id = None
+        if len(parts) >= 4:
+            raw_aid = parts[3]
+            if raw_aid and raw_aid != "0" and raw_aid != "None":
+                author_id = raw_aid
+
+        orig_text = getattr(call.message, 'html_text', None) or call.message.text or getattr(call.message, 'html_caption', None) or call.message.caption or ""
+        _, contact = extract_body_and_contact(orig_text)
+        clean_contact = None
+        if contact and "⚠️" not in contact and contact != "Не указан":
+            _, norm_u = normalize_identifier(contact)
+            clean_contact = norm_u or contact.lstrip('@').strip().lower()
+
+        blocked_any = False
+        if author_id or clean_contact:
+            blocked_any = add_blocked_user(author_id or clean_contact, clean_contact, "Бан с модерации (1 клик)")
+            # Если есть и числовой ID, и отдельный контакт в тексте — гарантируем запись обоих
+            if author_id and clean_contact:
+                add_blocked_user(clean_contact, clean_contact, f"Контакт автора ID {author_id} (Бан с модерации)")
+
+        ban_details = []
+        if clean_contact:
+            ban_details.append(f"@{clean_contact}")
+        if author_id:
+            ban_details.append(f"ID: <code>{author_id}</code>")
+        ban_info_str = ", ".join(ban_details) if ban_details else "автор"
+
+        try:
+            bot.edit_message_text(
+                f"🚫 <b>АВТОР ВНЕСЕН В ЧС ({ban_info_str}) И ПОСТ ОТКЛОНЕН</b>",
+                chat_id,
+                call.message.message_id,
+                parse_mode='HTML'
+            )
+        except Exception:
+            bot.send_message(chat_id, f"🚫 <b>АВТОР ВНЕСЕН В ЧС ({ban_info_str}) И ПОСТ ОТКЛОНЕН</b>", parse_mode='HTML')
+
+        bot.answer_callback_query(call.id, f"🚫 Заблокирован: {', '.join(ban_details) or 'автор'}")
+        return
+
+    if data in ("toggle_sf_comment", "toggle_sf_comment_adm"):
+        new_state = toggle_tech_comment()
+        status_str = "🟢 ВКЛЮЧЕН" if new_state else "🔴 ВЫКЛЮЧЕН"
+        bot.answer_callback_query(call.id, f"💬 Тех. коммент на вакансиях: {status_str}")
+        try:
+            if data.endswith("_adm"):
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_admin_panel_markup())
+            else:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_parser_menu())
+        except Exception:
+            pass
+        return
+
+    if data in ("toggle_sf_live", "toggle_sf_live_adm"):
+        new_state = toggle_live_mode()
+        if new_state:
+            bot.answer_callback_query(call.id, "🚀 Умный фильтр ПУЩЕН В БОЙ! Мусор и скам теперь блокируются автоматически.", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "🧪 Включен ТЕСТОВЫЙ РЕЖИМ: все вакансии приходят на модерацию с тех. комментарием.", show_alert=True)
+        try:
+            if data.endswith("_adm"):
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_admin_panel_markup())
+            else:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_parser_menu())
+        except Exception:
+            pass
+        return
+
     if data.startswith("blocklist_del_"):
         user_id = data.replace("blocklist_del_", "")
         if remove_blocked_user(user_id):
             bot.answer_callback_query(call.id, "✅ Пользователь удалён из ЧС")
         else:
             bot.answer_callback_query(call.id, "❌ Ошибка удаления")
-        callback_handler(call)
+        blocked = get_blocked_users()
+        if blocked:
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            for u in blocked:
+                display = u['username'] or u['user_id']
+                markup.add(types.InlineKeyboardButton(f"❌ {display}", callback_data=f"blocklist_del_{u['user_id']}"))
+            markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data="adm_blocklist"))
+            try:
+                bot.edit_message_text("🗑️ Выберите пользователя для удаления из ЧС:", chat_id, call.message.message_id, reply_markup=markup)
+            except Exception:
+                bot.send_message(chat_id, "🗑️ Выберите пользователя для удаления из ЧС:", reply_markup=markup)
+        else:
+            try:
+                bot.edit_message_text("📭 ЧС пуст", chat_id, call.message.message_id, reply_markup=get_nav_menu("adm_blocklist"))
+            except Exception:
+                bot.send_message(chat_id, "📭 ЧС пуст", reply_markup=get_nav_menu("adm_blocklist"))
         return
 
     if data.startswith("blocklist_info_"):
@@ -1640,10 +1603,25 @@ def callback_handler(call):
 
     if data == "toggle_recommends":
         settings = get_recommend_settings()
-        update_recommend_settings(is_enabled=1 if not settings["is_enabled"] else 0)
-        status_text = "🟢 ВКЛ" if not settings["is_enabled"] else "🔴 ВЫКЛ"
+        new_enabled = 1 if not settings["is_enabled"] else 0
+        update_recommend_settings(is_enabled=new_enabled)
+        status_text = "🟢 ВКЛ" if new_enabled else "🔴 ВЫКЛ"
         bot.answer_callback_query(call.id, f"Отображение {status_text}")
-        callback_handler(call)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"🔘 Отображение: {status_text}", callback_data="toggle_recommends"),
+            types.InlineKeyboardButton("📝 Текст кнопки", callback_data="edit_recommend_button"),
+            types.InlineKeyboardButton("📝 Текст 'Выберите категорию'", callback_data="edit_select_category_text"),
+            types.InlineKeyboardButton("📝 Текст 'Выберите специалиста'", callback_data="edit_select_specialist_text"),
+            types.InlineKeyboardButton("📊 Показать статистику", callback_data="recommend_stats"),
+            types.InlineKeyboardButton("🗂️ Управление категориями", callback_data="manage_categories"),
+            types.InlineKeyboardButton("👤 Управление карточками", callback_data="manage_cards"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")
+        )
+        try:
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=markup)
+        except Exception:
+            pass
         return
 
     if data == "edit_recommend_button":
@@ -1730,7 +1708,21 @@ def callback_handler(call):
         cat_id = int(data.replace("del_cat_", ""))
         delete_category(cat_id)
         bot.answer_callback_query(call.id, "Категория удалена")
-        callback_handler(call)
+        categories = get_categories()
+        if categories:
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            for cat in categories:
+                markup.add(types.InlineKeyboardButton(f"❌ {cat['icon']} {cat['name']}", callback_data=f"del_cat_{cat['id']}"))
+            markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data="manage_categories"))
+            try:
+                bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=markup)
+            except Exception:
+                pass
+        else:
+            try:
+                bot.edit_message_text("📭 Категорий больше нет.", chat_id, call.message.message_id, reply_markup=get_nav_menu("manage_categories"))
+            except Exception:
+                pass
         return
 
     if data == "manage_cards":
@@ -1793,9 +1785,26 @@ def callback_handler(call):
 
     if data.startswith("del_card_"):
         card_id = int(data.replace("del_card_", ""))
+        card = get_card_by_id(card_id)
+        cat_id = card["category_id"] if card else None
         delete_card(card_id)
         bot.answer_callback_query(call.id, "Карточка удалена")
-        callback_handler(call)
+        if cat_id:
+            cards = get_cards_by_category(cat_id)
+            if cards:
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                for c in cards:
+                    markup.add(types.InlineKeyboardButton(f"❌ {c['custom_text'].split(chr(10))[0][:30]}", callback_data=f"del_card_{c['id']}"))
+                markup.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"cards_cat_{cat_id}"))
+                try:
+                    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=markup)
+                except Exception:
+                    pass
+                return
+        try:
+            bot.edit_message_text("📭 Карточка удалена.", chat_id, call.message.message_id, reply_markup=get_nav_menu("manage_cards"))
+        except Exception:
+            pass
         return
 
     if data == "add_card":
@@ -1821,13 +1830,17 @@ def callback_handler(call):
     if data.startswith("edit_contact_"):
         original_message_id = int(data.replace("edit_contact_", ""))
         message_link = None
+        author_id = 0
         if call.message.reply_markup:
             try:
                 for row in call.message.reply_markup.keyboard:
                     for btn in row:
                         if hasattr(btn, 'url') and btn.url and "t.me" in btn.url:
                             message_link = btn.url
-                            break
+                        if hasattr(btn, 'callback_data') and btn.callback_data and btn.callback_data.startswith("ban_mod_"):
+                            bparts = btn.callback_data.split("_")
+                            if len(bparts) >= 4:
+                                author_id = bparts[3]
             except Exception as e:
                 print(f"Ошибка при поиске ссылки: {e}")
         
@@ -1838,6 +1851,7 @@ def callback_handler(call):
         pending_contacts[original_message_id] = {
             "original_text": orig_text,
             "message_link": message_link,
+            "author_id": author_id,
             "chat_id": str(target_chat_id),
             "user_id": str(target_chat_id),
             "admin_id": call.from_user.id,
@@ -1877,13 +1891,17 @@ def callback_handler(call):
     if data.startswith("edit_text_"):
         original_message_id = int(data.replace("edit_text_", ""))
         message_link = None
+        author_id = 0
         if call.message.reply_markup:
             try:
                 for row in call.message.reply_markup.keyboard:
                     for btn in row:
                         if hasattr(btn, 'url') and btn.url and "t.me" in btn.url:
                             message_link = btn.url
-                            break
+                        if hasattr(btn, 'callback_data') and btn.callback_data and btn.callback_data.startswith("ban_mod_"):
+                            bparts = btn.callback_data.split("_")
+                            if len(bparts) >= 4:
+                                author_id = bparts[3]
             except Exception as e:
                 print(f"Ошибка при поиске ссылки: {e}")
                 
@@ -1896,6 +1914,7 @@ def callback_handler(call):
             "original_text": orig_text,
             "contact": contact,
             "message_link": message_link,
+            "author_id": author_id,
             "chat_id": str(target_chat_id),
             "user_id": str(target_chat_id),
             "admin_id": call.from_user.id,
@@ -1941,22 +1960,22 @@ def callback_handler(call):
         bot.answer_callback_query(call.id)
         return
 
-    if data.startswith("pub_decline_special_"):
+    if data.startswith("pub_decline_special"):
         try:
-            bot.edit_message_text(f"❌ <b>ОТКЛОНЕНО</b>", chat_id, call.message.message_id, parse_mode='HTML')
+            bot.edit_message_text("❌ <b>ОТКЛОНЕНО</b>", chat_id, call.message.message_id, parse_mode='HTML')
         except:
-            bot.send_message(chat_id, f"❌ <b>ОТКЛОНЕНО</b>", parse_mode='HTML')
+            bot.send_message(chat_id, "❌ <b>ОТКЛОНЕНО</b>", parse_mode='HTML')
         bot.answer_callback_query(call.id)
         return
 
     if data.startswith("sendto_special_"):
-        parts = data.split("_")
-        category = parts[2]
-        original_message_id = int(parts[3])
+        rest = data.replace("sendto_special_", "", 1)
+        category, orig_id_str = rest.rsplit("_", 1)
+        original_message_id = int(orig_id_str)
         config = CHANNELS_CONFIG.get(category)
         if config:
             target = config["channel"]
-            orig = call.message.text or call.message.caption or ""
+            orig = getattr(call.message, 'html_text', None) or getattr(call.message, 'html_caption', None) or call.message.text or call.message.caption or ""
             # Спаршенные посты всегда являются вакансиями
             is_resume = False
             final = format_post(orig, category, is_resume=is_resume)
@@ -1970,7 +1989,7 @@ def callback_handler(call):
                 category_id = CHANNEL_TO_CATEGORY.get(target)
                 if category_id:
                     save_vacancy_to_both(final, category_id, target, message_id, f"https://t.me/{target[1:]}/{message_id}")
-                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML')
+                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML', disable_web_page_preview=True)
             except Exception as e: 
                 bot.answer_callback_query(call.id, f"Ошибка: {e}")
         return
@@ -1997,7 +2016,7 @@ def callback_handler(call):
         config = CHANNELS_CONFIG.get(category)
         if config:
             target = config["channel"]
-            orig = call.message.text or call.message.caption or ""
+            orig = getattr(call.message, 'html_text', None) or getattr(call.message, 'html_caption', None) or call.message.text or call.message.caption or ""
             is_resume = is_post_resume_by_context(orig, call.message.message_thread_id)
             final = format_post(orig, category, is_resume=is_resume)
             try:
@@ -2010,7 +2029,7 @@ def callback_handler(call):
                 category_id = CHANNEL_TO_CATEGORY.get(target)
                 if category_id:
                     save_vacancy_to_both(final, category_id, target, message_id, f"https://t.me/{target[1:]}/{message_id}")
-                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML')
+                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML', disable_web_page_preview=True)
             except Exception as e: 
                 bot.answer_callback_query(call.id, f"Ошибка: {e}")
         return
@@ -2051,9 +2070,8 @@ def callback_handler(call):
         return
 
     if data.startswith("publish_now_to_"):
-        parts = data.replace("publish_now_to_", "").split("_")
-        category = parts[0]
-        target_id = parts[1]
+        rest = data.replace("publish_now_to_", "", 1)
+        category, target_id = rest.rsplit("_", 1)
         
         u_threads = load_json(DATA_FILE, {})
         u_data = u_threads.get(target_id, {})
@@ -2078,7 +2096,7 @@ def callback_handler(call):
                 if category_id:
                     save_vacancy_to_both(final, category_id, target, message_id, f"https://t.me/{target[1:]}/{message_id}")
                     
-                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML')
+                bot.edit_message_text(f"🚀 <b>ОПУБЛИКОВАНО В: {category}</b>\n\n{final}", chat_id, call.message.message_id, parse_mode='HTML', disable_web_page_preview=True)
             except Exception as e:
                 bot.answer_callback_query(call.id, f"Ошибка публикации: {e}")
         else:
@@ -2251,31 +2269,51 @@ def add_blocked_user_step(message):
     if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
+    if chat_id not in user_threads:
+        user_threads[chat_id] = {}
     
     if message.text and message.text.startswith('/'):
         return
-    
-    # Парсим ввод
-    user_id, username = parse_user_input(message.text)
-    
-    if not user_id and not username:
-        bot.send_message(chat_id, "❌ Не удалось распознать пользователя. Попробуйте ещё раз.")
+
+    user_id = None
+    username = None
+
+    # Поддержка пересланного сообщения от спамера
+    if getattr(message, "forward_from", None):
+        user_id = message.forward_from.id
+        username = message.forward_from.username
+    elif getattr(message, "forward_from_chat", None):
+        user_id = message.forward_from_chat.id
+        username = message.forward_from_chat.username
+    elif message.text:
+        user_id, username = parse_user_input(message.text)
+
+    if user_id == "CHAT_MSG_LINK":
+        msg = bot.send_message(
+            chat_id,
+            "⚠️ Вы отправили ссылку на сообщение в чате (<code>t.me/c/...</code>), а не на профиль автора!\n\n"
+            "Чтобы заблокировать автора вакансии без @username, нажмите кнопку <b>«🚫 В ЧС»</b> прямо под постом на модерации, "
+            "либо введите @username или числовой ID автора:",
+            parse_mode='HTML',
+            reply_markup=get_cancel_menu()
+        )
+        bot.register_next_step_handler(msg, add_blocked_user_step)
         return
     
-    # Если нашли username, пробуем получить ID через бота
+    if not user_id and not username:
+        msg = bot.send_message(chat_id, "❌ Не удалось распознать пользователя. Введите ID, @username или ссылку https://t.me/username:", reply_markup=get_cancel_menu())
+        bot.register_next_step_handler(msg, add_blocked_user_step)
+        return
+    
+    # Если нашли username, пробуем получить ID через бота (сработает, если это канал или юзер писал боту)
     if username and not user_id:
         try:
-            # Пробуем получить пользователя через @username
             chat = bot.get_chat(f"@{username}")
             user_id = chat.id
-            username = chat.username
-        except:
-            # Если не получилось, сохраняем с username
+            if chat.username:
+                username = chat.username.lower()
+        except Exception:
             pass
-    
-    if not user_id and not username:
-        bot.send_message(chat_id, "❌ Не удалось найти пользователя. Укажите ID или @username.")
-        return
     
     # Запрашиваем причину
     user_threads[chat_id]["blocked_user_data"] = {"user_id": user_id, "username": username}
@@ -2293,6 +2331,8 @@ def save_blocked_user_reason(message):
     if check_menu_escape(message): return
     chat_id = str(message.chat.id)
     user_threads = load_json(DATA_FILE, {})
+    if chat_id not in user_threads:
+        user_threads[chat_id] = {}
     
     data = user_threads.get(chat_id, {}).get("blocked_user_data", {})
     user_id = data.get("user_id")
@@ -2314,7 +2354,7 @@ def save_blocked_user_reason(message):
             reply_markup=get_nav_menu("adm_blocklist")
         )
     else:
-        bot.send_message(chat_id, "❌ Ошибка при добавлении в ЧС (возможно, пользователь уже есть).")
+        bot.send_message(chat_id, "❌ Ошибка при добавлении в ЧС.")
     
     # Очищаем временные данные
     if chat_id in user_threads:
@@ -2405,7 +2445,8 @@ def handle_admin_text(message):
                     target_chat_id,
                     original_msg_id,
                     parse_mode='HTML',
-                    reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"))
+                    disable_web_page_preview=True,
+                    reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"), data.get("author_id", 0))
                 )
             except Exception as e:
                 if "there is no text in the message" in str(e).lower():
@@ -2414,7 +2455,7 @@ def handle_admin_text(message):
                         chat_id=target_chat_id,
                         message_id=original_msg_id,
                         parse_mode='HTML',
-                        reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"))
+                        reply_markup=get_special_moderation_markup(original_msg_id, data.get("message_link"), data.get("author_id", 0))
                     )
                 else:
                     raise e
@@ -2456,7 +2497,8 @@ def handle_admin_text(message):
                     target_chat_id,
                     original_msg_id,
                     parse_mode='HTML',
-                    reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"))
+                    disable_web_page_preview=True,
+                    reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"), data.get("author_id", 0))
                 )
             except Exception as e:
                 if "there is no text in the message" in str(e).lower():
@@ -2465,7 +2507,7 @@ def handle_admin_text(message):
                         chat_id=target_chat_id,
                         message_id=original_msg_id,
                         parse_mode='HTML',
-                        reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"))
+                        reply_markup=get_special_moderation_after_edit_markup(original_msg_id, data.get("message_link"), data.get("author_id", 0))
                     )
                 else:
                     raise e
@@ -2706,6 +2748,10 @@ def handle_user_messages(message):
     if action_info:
         handle_admin_text(message)
         return
+    # Проверка ЧС для обычных пользователей, пишущих в бота
+    if message.from_user and message.from_user.id not in ADMIN_IDS:
+        if is_user_blocked(user_id=message.from_user.id, username=message.from_user.username):
+            return
     if message.text == "🏠 Главное меню":
         bot.clear_step_handler_by_chat_id(chat_id)
         user_threads = load_json(DATA_FILE, {})
@@ -2736,8 +2782,9 @@ def handle_user_messages(message):
         bot.send_message(SUPER_GROUP_ID, label, message_thread_id=user_data["thread_id"], parse_mode='HTML')
         copied_msg = bot.copy_message(SUPER_GROUP_ID, chat_id, message.message_id, message_thread_id=user_data["thread_id"], reply_markup=get_user_info_btn(chat_id))
         
-        # Сохраняем черновик
-        user_threads[chat_id]["post_text"] = message.text or message.caption or ""
+        # Сохраняем черновик с сохранением HTML-разметки (без вшитых ссылок)
+        raw_draft = getattr(message, 'html_text', None) or getattr(message, 'html_caption', None) or message.text or message.caption or ""
+        user_threads[chat_id]["post_text"] = strip_html_links_keep_formatting(raw_draft)
         user_threads[chat_id]["post_photo"] = message.photo[-1].file_id if message.photo else None
         user_threads[chat_id]["post_msg_id"] = copied_msg.message_id
         
